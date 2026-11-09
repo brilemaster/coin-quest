@@ -640,12 +640,9 @@ const Sound = {
       this.ac.onstatechange = () => { if (this.ac.state === 'running' && !this.muted) Game.toast('SOUND ON'); };
       // iPhone/iPad: play as media, so the silent switch doesn't swallow the game.
       try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
-      try {
-        const keep = new Audio('data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAQB8AAIA+AAACABAAZGF0YQAAAAA=');
-        keep.loop = true; keep.play().catch(() => {});
-      } catch (e) {}
     }
     if (this.ac.state !== 'running') this.ac.resume().catch(() => {});
+    if (typeof MenuSong !== 'undefined') MenuSong.update(true);
     if (!this.primed) { // older iPhones only unlock audio when a sound starts inside the tap itself
       try {
         const b = this.ac.createBuffer(1, 1, 22050), src = this.ac.createBufferSource();
@@ -854,38 +851,56 @@ const SONGS = {
    so mute, volume and TAP FOR SOUND all apply. */
 const MenuSong = {
   title: 'BILLING GANGSTERS', level: 0.16, // the song is mastered loud; this sits it with the chiptunes
-  buffer: null, decoding: false, src: null, gain: null, wanted: false,
-  want(on) { this.wanted = on; if (!on) this.fadeOut(); },
-  update() {
+  el: null, gain: null, wanted: false, playing: false, fromStart: true, stopTimer: null,
+  // Build the player once: the MP3 stays compressed (a few MB) and streams as it plays.
+  ensure() {
+    if (this.el || !window.MENU_SONG_B64 || !Sound.ac) return;
+    try {
+      const bin = atob(window.MENU_SONG_B64), bytes = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+      window.MENU_SONG_B64 = null;                 // free the text copy
+      const el = new Audio(URL.createObjectURL(new Blob([bytes], { type: 'audio/mpeg' })));
+      el.loop = true; el.preload = 'auto'; el.setAttribute('playsinline', '');
+      this.gain = Sound.ac.createGain();
+      this.gain.gain.value = 0;
+      Sound.ac.createMediaElementSource(el).connect(this.gain);  // through the master volume
+      this.gain.connect(Sound.out);
+      this.el = el;
+    } catch (e) { window.MENU_SONG_B64 = null; }
+  },
+  want(on) {
+    this.wanted = on;
+    if (!on) this.fadeOut(true);
+  },
+  update(fromTap) {
     const ac = Sound.ac;
-    if (!ac || !window.MENU_SONG_B64) return;
-    if (!this.buffer && !this.decoding) {      // decode once, the first time sound is on
-      this.decoding = true;
-      try {
-        const bin = atob(window.MENU_SONG_B64), bytes = new Uint8Array(bin.length);
-        for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-        ac.decodeAudioData(bytes.buffer, b => { this.buffer = b; }, () => { this.decoding = false; window.MENU_SONG_B64 = null; });
-      } catch (e) { window.MENU_SONG_B64 = null; }
-    }
-    if (this.wanted && !this.src && this.buffer && ac.state === 'running') this.start();
+    if (!ac) return;
+    this.ensure();
+    if (this.wanted && !this.playing && this.el && !document.hidden && (ac.state === 'running' || fromTap)) this.start();
   },
   start() {
-    const ac = Sound.ac, t = ac.currentTime;
-    this.gain = ac.createGain();
-    this.gain.gain.setValueAtTime(0, t);
-    this.gain.gain.linearRampToValueAtTime(this.level, t + 0.8);
-    this.gain.connect(Sound.out);
-    const src = ac.createBufferSource();
-    src.buffer = this.buffer; src.loop = true;
-    src.connect(this.gain); src.start(t);
-    this.src = src;
+    clearTimeout(this.stopTimer);
+    const ac = Sound.ac, t = ac.currentTime, g = this.gain.gain;
+    if (this.fromStart) { try { this.el.currentTime = 0; } catch (e) {} this.fromStart = false; }
+    this.el.play().catch(() => { this.playing = false; });
+    g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(this.level, t + 0.8);
+    this.playing = true;
   },
-  fadeOut() {
-    if (!this.src) return;
+  fadeOut(toStart) {
+    if (!this.el || !this.playing) { if (toStart) this.fromStart = true; return; }
     const ac = Sound.ac, t = ac.currentTime, g = this.gain.gain;
     g.cancelScheduledValues(t); g.setValueAtTime(g.value, t); g.linearRampToValueAtTime(0, t + 0.9);
-    this.src.stop(t + 1);
-    this.src = null;
+    this.playing = false;
+    if (toStart) this.fromStart = true;
+    this.stopTimer = setTimeout(() => { if (!this.playing) this.el.pause(); }, 950);
+  },
+  // Leaving the page: stop right away (no fade), keep the spot to resume from.
+  pauseNow() {
+    if (!this.el) return;
+    clearTimeout(this.stopTimer);
+    this.el.pause();
+    if (this.gain) this.gain.gain.value = 0;
+    this.playing = false;
   },
 };
 
@@ -2913,7 +2928,19 @@ function frame(now) {
 }
 
 window.addEventListener('blur', () => { Input.clear(); Game.pause(); });
-document.addEventListener('visibilitychange', () => { lastTime = performance.now(); });
+document.addEventListener('visibilitychange', () => {
+  lastTime = performance.now();
+  if (document.hidden) {                       // switched away or closing: stop all sound now
+    MenuSong.pauseNow();
+    if (Sound.ac && Sound.ac.state === 'running') Sound.ac.suspend().catch(() => {});
+  } else if (Sound.ac) {
+    Sound.ac.resume().catch(() => {});         // the menu song picks up on the next tick
+  }
+});
+window.addEventListener('pagehide', () => {   // the page is going away: let go of the audio
+  MenuSong.pauseNow();
+  if (Sound.ac) Sound.ac.suspend().catch(() => {});
+});
 
 fitCanvas();
 Game.set('title');
